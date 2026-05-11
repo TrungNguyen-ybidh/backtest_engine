@@ -2,22 +2,28 @@
 
 from datetime import date
 
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+
 from .broker import Broker
 from .config import BacktestConfig
+from .data_interface import DataInterface
 from .engine import Engine
 from .models import FixedBpsSlippage, PerShareCommission
 from .strategy import BuyAndHold
 
 
 def main() -> None:
+    load_dotenv()
+
     config = BacktestConfig(
         start_date=date(2023, 1, 1),
         end_date=date(2024, 1, 1),
         initial_capital=100_000.0,
         tickers=["AAPL"],
+        benchmark="SPY",
     )
 
-    # data = DataInterface(create_engine(config.db_url))
     strategy = BuyAndHold(config.tickers)
     broker = Broker(
         initial_cash=config.initial_capital,
@@ -25,9 +31,13 @@ def main() -> None:
         slippage=FixedBpsSlippage(config.slippage_bps),
     )
 
-    # engine = Engine(config, data, strategy, broker)
-    # engine.run()
-    # Analytics(engine.history).print_summary()
+    sql_engine = create_engine(config.db_url)
+    with DataInterface(sql_engine) as data:
+        engine = Engine(config, data, strategy, broker)
+        engine.run()
+
+    print(f"final value: ${engine.history[-1]['total_value']:,.2f}")
+    print(f"trades:      {len(broker.trades)}")
 
 
 if __name__ == "__main__":
