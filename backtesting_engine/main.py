@@ -18,10 +18,10 @@ def main() -> None:
     load_dotenv()
 
     config = BacktestConfig(
-        start_date=date(2023, 1, 1),
+        start_date=date(2000, 1, 1),
         end_date=date(2024, 1, 1),
         initial_capital=100_000.0,
-        tickers=["AAPL"],
+        tickers=["NVDA"],
     )
 
     strategy = BuyAndHold(config.tickers)
