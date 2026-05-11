@@ -5,6 +5,7 @@ from datetime import date
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 
+from .analytics import Analytics
 from .broker import Broker
 from .config import BacktestConfig
 from .data_interface import DataInterface
@@ -36,8 +37,7 @@ def main() -> None:
         engine = Engine(config, data, strategy, broker)
         engine.run()
 
-    print(f"final value: ${engine.history[-1]['total_value']:,.2f}")
-    print(f"trades:      {len(broker.trades)}")
+    Analytics(engine.history, trades=broker.trades, config=config).print_summary()
 
 
 if __name__ == "__main__":
