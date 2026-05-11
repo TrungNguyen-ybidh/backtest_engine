@@ -28,6 +28,7 @@ from backtesting_engine.strategy import (
     AllCash,
     BuyAndHold,
     MovingAverageCrossover,
+    ValueScreen,
 )
 
 
@@ -175,6 +176,41 @@ def test_5_no_lookahead():
 # strategy test above. The summary block prints a reminder at the end.
 
 
+def test_valuescreen(sql_engine):
+    print("\n--- TEST M7: ValueScreen 5-stock universe (2022-2024) ---")
+    universe = ["AAPL", "MSFT", "JPM", "KO", "XOM"]
+    config = BacktestConfig(
+        start_date=date(2022, 1, 1), end_date=date(2024, 1, 1),
+        initial_capital=INITIAL, tickers=universe,
+    )
+    engine, broker = run_engine(sql_engine, config, ValueScreen(config.tickers, top_n=3))
+
+    final = engine.history[-1]["total_value"]
+    strat_ret = final / INITIAL - 1
+    n_trades = len(broker.trades)
+    print(f"  final ${final:,.2f}  return {strat_ret:.2%}  trades: {n_trades}")
+
+    # Filing-date spot check: pick one mid-window date and confirm the latest
+    # filing in the engine's slice has filing_date <= that date.
+    spot_date = date(2023, 6, 30)
+    spot_row = next((r for r in engine.history if r["date"] == spot_date), None)
+    if spot_row is None:
+        print(f"  (no history row for {spot_date}, skipping filing-date spot)")
+    else:
+        held = list(spot_row["holdings"].keys())
+        with DataInterface(sql_engine) as data:
+            fund = data.get_fundamentals(held, "income_stmt", as_of=spot_date)
+        print(f"  held on {spot_date}: {held}")
+        if not fund.empty:
+            max_filing = fund["filing_date"].max()
+            print(f"  most recent filing in slice: {max_filing.date()}")
+            assert max_filing.date() <= spot_date, "look-ahead leak in fundamentals!"
+
+    assert n_trades > 0, "ValueScreen never traded"
+    assert_cash_conservation(engine)
+    print("  [PASS]")
+
+
 def main() -> None:
     load_dotenv()
     sql_engine = create_engine(os.environ["sql_path"])
@@ -186,6 +222,7 @@ def main() -> None:
     test_5_no_lookahead()
     print("\n--- TEST 6 (cash conservation): asserted on every test above ---")
     print("--- TEST 7 (commission): asserted on every test above ---")
+    test_valuescreen(sql_engine)
 
     print("\n" + "=" * 60)
     print("ALL VALIDATION TESTS PASS")

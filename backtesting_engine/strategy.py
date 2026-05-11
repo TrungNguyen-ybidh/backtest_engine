@@ -172,3 +172,76 @@ class MovingAverageCrossover(Strategy):
                 weights[ticker] = slot
 
         return weights
+
+
+class ValueScreen(Strategy):
+    """Pick the top-N tickers by earnings yield (EPS / price), equal weight.
+
+    Earnings yield uses the most recent quarterly EPS as a proxy — NOT TTM.
+    For ranking purposes within a fixed quarterly cadence this is consistent
+    across tickers; if you want TTM, sum the last 4 quarters before dividing.
+    Limitation flagged in build notes.
+
+    Look-ahead safety: engine pre-filters fundamentals by `filing_date <=
+    current_date` and the base class double-checks. We always use the most
+    recently *filed* report, never the most recent fiscal period.
+    """
+
+    requires_fundamentals = ("income_stmt",)
+
+    def __init__(self, tickers: list[str], top_n: int = 3):
+        if not isinstance(tickers, list):
+            raise TypeError(f"tickers must be a list, got {type(tickers).__name__}")
+        if any(not isinstance(t, str) or not t for t in tickers):
+            raise ValueError("every ticker must be a non-empty string")
+        if not isinstance(top_n, int) or top_n <= 0:
+            raise ValueError("top_n must be a positive int")
+        if top_n > len(tickers):
+            raise ValueError(
+                f"top_n ({top_n}) cannot exceed universe size ({len(tickers)})"
+            )
+
+        self.tickers = [t.upper() for t in tickers]
+        self.top_n = top_n
+
+    def _compute(self, current_date, price_data, fundamentals):
+        if not fundamentals or "income_stmt" not in fundamentals:
+            return {}
+
+        income = fundamentals["income_stmt"]
+        if income.empty or price_data.empty:
+            return {}
+
+        # Most recent close per ticker — use the last row up through today.
+        latest_close = (
+            price_data.sort_values(["ticker", "date"])
+            .groupby("ticker")["close"]
+            .last()
+        )
+
+        # Most recent filing per ticker that satisfies filing_date <= current_date.
+        # Engine already slices by filing_date upstream, so all rows here are eligible.
+        latest_filing = (
+            income.sort_values(["ticker", "filing_date"])
+            .groupby("ticker")
+            .tail(1)
+            .set_index("ticker")
+        )
+
+        yields: dict[str, float] = {}
+        for ticker in self.tickers:
+            if ticker not in latest_filing.index or ticker not in latest_close.index:
+                continue
+            eps = latest_filing.loc[ticker, "eps"]
+            price = latest_close.loc[ticker]
+            if pd.isna(eps) or pd.isna(price) or price <= 0 or eps <= 0:
+                continue  # skip negative-earnings or missing-data names
+            yields[ticker] = float(eps) / float(price)
+
+        if not yields:
+            return {}
+
+        # Pick top N by yield, equal weight.
+        top = sorted(yields, key=yields.get, reverse=True)[: self.top_n]
+        w = 1.0 / self.top_n
+        return {t: w for t in top}

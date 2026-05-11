@@ -68,6 +68,15 @@ class Engine:
                 f"tickers with no price data in window: {sorted(missing_tickers)}"
             )
 
+        # Pre-fetch any fundamental statements the strategy needs. One DB hit per
+        # statement for the whole window; we slice by filing_date per day in memory.
+        # Pass `as_of=end_date` so we get every filing up to the backtest end.
+        all_fundamentals: dict[str, pd.DataFrame] = {}
+        for statement in getattr(self.strategy, "requires_fundamentals", ()):
+            all_fundamentals[statement] = self.data.get_fundamentals(
+                self.config.tickers, statement, as_of=self.config.end_date
+            )
+
         # Normalize the date column to plain Python date for comparisons with
         # current_date (which Strategy.generate_signals expects as datetime.date).
         all_prices = all_prices.copy()
@@ -86,7 +95,21 @@ class Engine:
                 columns=["date_only"]
             )
 
-            weights = self.strategy.generate_signals(current_date, price_hist)
+            # Slice fundamentals by filing_date <= current_date. Critical rule #2:
+            # `filing_date` (when public) gates look-ahead, not period-end `date`.
+            fundamentals_today: dict[str, pd.DataFrame] | None = None
+            if all_fundamentals:
+                fundamentals_today = {}
+                for name, df in all_fundamentals.items():
+                    if df.empty or "filing_date" not in df.columns:
+                        fundamentals_today[name] = df
+                        continue
+                    mask = df["filing_date"].dt.date <= current_date
+                    fundamentals_today[name] = df[mask]
+
+            weights = self.strategy.generate_signals(
+                current_date, price_hist, fundamentals=fundamentals_today
+            )
 
             # Mark-to-market using today's close. If a held ticker has no price
             # today (delisting/halt mid-window), skip rebalance and record the gap.
