@@ -22,7 +22,6 @@ def main() -> None:
         end_date=date(2024, 1, 1),
         initial_capital=100_000.0,
         tickers=["AAPL"],
-        benchmark="SPY",
     )
 
     strategy = BuyAndHold(config.tickers)

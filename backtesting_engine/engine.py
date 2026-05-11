@@ -49,6 +49,25 @@ class Engine:
                 "no price data returned — check tickers and date range against the DB"
             )
 
+        # Fail fast on missing benchmark. Silently returning None per-row masks
+        # config errors (e.g., benchmark='SPY' but DB only has individual stocks)
+        # and breaks Analytics downstream.
+        if self.config.benchmark:
+            available = set(all_prices["ticker"].unique())
+            if self.config.benchmark not in available:
+                raise ValueError(
+                    f"benchmark {self.config.benchmark!r} not found in price data "
+                    f"for {self.config.start_date}..{self.config.end_date}. "
+                    f"Set benchmark=None or pick one of: {sorted(available)}"
+                )
+
+        # Likewise for configured tickers: warn if any are missing entirely.
+        missing_tickers = set(self.config.tickers) - set(all_prices["ticker"].unique())
+        if missing_tickers:
+            raise ValueError(
+                f"tickers with no price data in window: {sorted(missing_tickers)}"
+            )
+
         # Normalize the date column to plain Python date for comparisons with
         # current_date (which Strategy.generate_signals expects as datetime.date).
         all_prices = all_prices.copy()
