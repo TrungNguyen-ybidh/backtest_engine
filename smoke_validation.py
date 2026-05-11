@@ -13,12 +13,15 @@ The 7 tests:
   7. Commission verification — sum > 0 and matches per-share model.
 """
 
+import math
 import os
 from datetime import date
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 
+from backtesting_engine.analytics import Analytics
 from backtesting_engine.broker import Broker
 from backtesting_engine.config import BacktestConfig
 from backtesting_engine.data_interface import DataInterface
@@ -211,6 +214,101 @@ def test_valuescreen(sql_engine):
     print("  [PASS]")
 
 
+def test_analytics_m5_1(sql_engine):
+    """M5.1: FIFO trade matching, trade stats, risk metrics, HTML report.
+
+    Re-runs three engines (AllCash, BuyAndHold single, MA Crossover) so the
+    Analytics object has a fresh history + trade log for each. Cheap relative
+    to the cost of a real DB session.
+    """
+    print("\n--- TEST M5.1: Analytics enhancements ---")
+
+    # AllCash: no trades, no exposure. Trade-stat methods must not raise.
+    config_a = BacktestConfig(
+        start_date=date(2023, 1, 1), end_date=date(2024, 1, 1),
+        initial_capital=INITIAL, tickers=["AAPL"],
+    )
+    engine_a, broker_a = run_engine(sql_engine, config_a, AllCash())
+    an_a = Analytics(engine_a.history, trades=broker_a.trades, config=config_a)
+    assert an_a.trade_pnl.empty, "AllCash should have no closed round-trips"
+    assert an_a.total_trades() == 0
+    assert math.isnan(an_a.win_rate())
+    assert math.isnan(an_a.avg_win())
+    assert math.isnan(an_a.avg_loss())
+    assert math.isnan(an_a.profit_factor())
+    assert math.isnan(an_a.avg_trade_duration())
+    assert an_a.exposure_time() == 0.0
+    print(f"  AllCash: trade_pnl empty, exposure_time={an_a.exposure_time():.2f}  [ok]")
+
+    # BuyAndHold AAPL: 1 entry, position still open at end → 0 closed round-trips.
+    config_b = BacktestConfig(
+        start_date=date(2023, 1, 1), end_date=date(2024, 1, 1),
+        initial_capital=INITIAL, tickers=["AAPL"],
+    )
+    engine_b, broker_b = run_engine(sql_engine, config_b, BuyAndHold(config_b.tickers))
+    an_b = Analytics(engine_b.history, trades=broker_b.trades, config=config_b)
+    assert an_b.total_trades() == 0, (
+        f"BuyAndHold entry should leave 0 closed round-trips, got {an_b.total_trades()}"
+    )
+    assert not an_b.open_positions.empty, "open AAPL position should appear"
+    assert an_b.exposure_time() > 0.99, (
+        f"BuyAndHold should be ~always-invested, got {an_b.exposure_time():.3f}"
+    )
+    print(
+        f"  BuyAndHold AAPL: closed={an_b.total_trades()}, "
+        f"open_positions={len(an_b.open_positions)}, "
+        f"exposure_time={an_b.exposure_time():.3f}  [ok]"
+    )
+
+    # MA Crossover: enough trades to build round-trips. Realized P&L should
+    # not equal total P&L (open lots + commissions + slippage absorb the gap).
+    config_m = BacktestConfig(
+        start_date=date(2020, 1, 1), end_date=date(2024, 1, 1),
+        initial_capital=INITIAL, tickers=["AAPL"],
+    )
+    strat = MovingAverageCrossover(config_m.tickers, fast_window=50, slow_window=200)
+    engine_m, broker_m = run_engine(sql_engine, config_m, strat)
+    an_m = Analytics(engine_m.history, trades=broker_m.trades, config=config_m)
+    assert an_m.total_trades() >= 1, (
+        f"MA crossover should produce at least 1 closed round-trip, got {an_m.total_trades()}"
+    )
+    pf = an_m.profit_factor()
+    assert (pf == pf) and (pf == float("inf") or pf >= 0), (
+        f"profit_factor should be finite or +inf, got {pf}"
+    )
+    realized = float(an_m.trade_pnl["pnl"].sum())
+    total_pnl = engine_m.history[-1]["total_value"] - INITIAL
+    assert abs(realized - total_pnl) > 1.0, (
+        f"realized ({realized:.2f}) should differ from total ({total_pnl:.2f}) — "
+        "unrealized P&L + costs must absorb the difference"
+    )
+    print(
+        f"  MA Crossover: closed={an_m.total_trades()}, "
+        f"profit_factor={pf:.2f}, realized=${realized:,.2f}, "
+        f"total=${total_pnl:,.2f}  [ok]"
+    )
+
+    # Risk metrics return sensible numbers on the MA run.
+    sortino = an_m.sortino_ratio()
+    calmar = an_m.calmar_ratio()
+    assert sortino == sortino, "sortino should be finite on a real run"
+    assert calmar == calmar, "calmar should be finite on a real run"
+    print(f"  Sortino={sortino:.2f}, Calmar={calmar:.2f}  [ok]")
+
+    # HTML report renders to disk and is non-trivial.
+    report_path = Path("test_report.html")
+    try:
+        an_m.generate_report(str(report_path))
+        size = report_path.stat().st_size
+        assert size > 10_000, f"report size {size} bytes is suspiciously small"
+        print(f"  generate_report wrote {report_path} ({size:,} bytes)  [ok]")
+    finally:
+        if report_path.exists():
+            report_path.unlink()
+
+    print("  [PASS]")
+
+
 def main() -> None:
     load_dotenv()
     sql_engine = create_engine(os.environ["sql_path"])
@@ -223,6 +321,7 @@ def main() -> None:
     print("\n--- TEST 6 (cash conservation): asserted on every test above ---")
     print("--- TEST 7 (commission): asserted on every test above ---")
     test_valuescreen(sql_engine)
+    test_analytics_m5_1(sql_engine)
 
     print("\n" + "=" * 60)
     print("ALL VALIDATION TESTS PASS")

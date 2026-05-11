@@ -10,16 +10,27 @@ Run from project root:
     python smoke_offline.py
 """
 
-from datetime import date
+import math
+from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
+from backtesting_engine.analytics import Analytics
 from backtesting_engine.strategy import (
     AllCash,
     BuyAndHold,
     MovingAverageCrossover,
     ValueScreen,
 )
+
+
+class _Config:
+    """Minimal stand-in for BacktestConfig — only fields Analytics reads."""
+
+    def __init__(self, initial_capital=100_000.0, benchmark=None):
+        self.initial_capital = initial_capital
+        self.benchmark = benchmark
 
 
 def _price_frame(rows):
@@ -192,6 +203,171 @@ def test_valuescreen_no_filing_yet():
     print("  [PASS]")
 
 
+# ---------- M5.1 Analytics (offline, no DB) ----------
+
+def _build_history(dates, values, holdings_values=None):
+    """Build the dict-list history schema Engine produces."""
+    if holdings_values is None:
+        holdings_values = [0.0] * len(values)
+    return [
+        {
+            "date": d.date(),
+            "total_value": float(v),
+            "cash": float(v - hv),
+            "holdings_value": float(hv),
+            "holdings": {},
+            "benchmark_price": None,
+            "n_trades": 0,
+        }
+        for d, v, hv in zip(dates, values, holdings_values)
+    ]
+
+
+def test_analytics_allcash_offline():
+    print("\n--- M5.1 Analytics: AllCash empty round-trips ---")
+    dates = pd.bdate_range("2023-01-03", periods=20)
+    history = _build_history(dates, [100_000.0] * 20, [0.0] * 20)
+    an = Analytics(history, trades=[], config=_Config())
+    assert an.trade_pnl.empty
+    assert an.total_trades() == 0
+    assert math.isnan(an.win_rate())
+    assert math.isnan(an.avg_win())
+    assert math.isnan(an.avg_loss())
+    assert math.isnan(an.profit_factor())
+    assert math.isnan(an.avg_trade_duration())
+    assert an.exposure_time() == 0.0
+    print("  [PASS]")
+
+
+def test_analytics_buyandhold_open_position_offline():
+    print("\n--- M5.1 Analytics: BuyAndHold-style entry stays in open_positions ---")
+    dates = pd.bdate_range("2023-01-03", periods=20)
+    # Value rises from $100k to $110k while fully invested → exposure ≈ 1.0.
+    values = [100_000.0 + i * (10_000 / 19) for i in range(20)]
+    holdings_values = [v - 1_000.0 for v in values]  # always have holdings
+    history = _build_history(dates, values, holdings_values)
+    trades = [{
+        "date": dates[0].date(),
+        "ticker": "AAPL", "shares": 100, "fill_price": 150.0,
+        "commission": 1.0, "side": "buy",
+    }]
+    an = Analytics(history, trades=trades, config=_Config())
+    assert an.total_trades() == 0, "entry-only ⇒ no closed round-trip"
+    assert len(an.open_positions) == 1
+    assert an.open_positions.iloc[0]["shares_remaining"] == 100
+    assert an.exposure_time() > 0.99
+    print(f"  exposure_time={an.exposure_time():.3f}, open={len(an.open_positions)}  [PASS]")
+
+
+def test_analytics_fifo_matching_offline():
+    print("\n--- M5.1 Analytics: FIFO round-trip matching ---")
+    base = date(2023, 1, 3)
+    trades = [
+        # Two buy lots, one partial sell, one full sell, one residual buy.
+        {"date": base, "ticker": "AAPL", "shares": 100, "fill_price": 100.0, "commission": 1.0, "side": "buy"},
+        {"date": base + timedelta(days=5), "ticker": "AAPL", "shares": 50, "fill_price": 110.0, "commission": 1.0, "side": "buy"},
+        {"date": base + timedelta(days=10), "ticker": "AAPL", "shares": -120, "fill_price": 120.0, "commission": 1.0, "side": "sell"},
+        {"date": base + timedelta(days=20), "ticker": "AAPL", "shares": -30, "fill_price": 130.0, "commission": 1.0, "side": "sell"},
+        {"date": base + timedelta(days=25), "ticker": "AAPL", "shares": 10, "fill_price": 140.0, "commission": 1.0, "side": "buy"},
+    ]
+    # History values are irrelevant to FIFO matching itself but Analytics needs ≥1 row.
+    dates = pd.bdate_range("2023-01-03", periods=30)
+    history = _build_history(dates, [100_000.0] * 30, [50_000.0] * 30)
+    an = Analytics(history, trades=trades, config=_Config())
+
+    # Expected closed rows: 100@100→120, 20@110→120, 30@110→130 ⇒ 3 round-trips.
+    assert an.total_trades() == 3, f"expected 3 closed round-trips, got {an.total_trades()}"
+    # Residual open lot: 10 shares from final buy.
+    assert len(an.open_positions) == 1
+    assert an.open_positions.iloc[0]["shares_remaining"] == 10
+
+    pnls = an.trade_pnl["pnl"].tolist()
+    # Per-row gross checks (costs are small but non-zero so test bands):
+    # Row 0: 100 * (120 - 100) = 2000, minus ~$1.83 of commission allocation.
+    assert 1995 < pnls[0] < 2000, pnls
+    # Row 1: 20 * (120 - 110) = 200
+    assert 198 < pnls[1] < 200, pnls
+    # Row 2: 30 * (130 - 110) = 600
+    assert 597 < pnls[2] < 600, pnls
+
+    # Win rate and profit factor sanity.
+    assert an.win_rate() == 1.0
+    assert an.profit_factor() == float("inf"), "no losers ⇒ profit_factor=inf"
+    assert math.isnan(an.avg_loss()) is False or an.avg_loss() != an.avg_loss()
+    print(f"  pnls={[round(p, 2) for p in pnls]}, open={len(an.open_positions)}  [PASS]")
+
+
+def test_analytics_profit_factor_with_losses():
+    print("\n--- M5.1 Analytics: profit_factor with wins + losses ---")
+    base = date(2023, 1, 3)
+    trades = [
+        {"date": base, "ticker": "AAPL", "shares": 100, "fill_price": 100.0, "commission": 1.0, "side": "buy"},
+        {"date": base + timedelta(days=5), "ticker": "AAPL", "shares": -100, "fill_price": 110.0, "commission": 1.0, "side": "sell"},  # +$1000
+        {"date": base + timedelta(days=10), "ticker": "AAPL", "shares": 100, "fill_price": 110.0, "commission": 1.0, "side": "buy"},
+        {"date": base + timedelta(days=15), "ticker": "AAPL", "shares": -100, "fill_price": 105.0, "commission": 1.0, "side": "sell"},  # -$500
+    ]
+    dates = pd.bdate_range("2023-01-03", periods=30)
+    history = _build_history(dates, [100_000.0] * 30, [50_000.0] * 30)
+    an = Analytics(history, trades=trades, config=_Config())
+    assert an.total_trades() == 2
+    pf = an.profit_factor()
+    # ~1000 / ~500 = ~2.0 (slightly off due to commissions). Accept 1.9–2.05.
+    assert 1.9 < pf < 2.05, f"expected pf~2, got {pf}"
+    assert an.win_rate() == 0.5
+    assert an.avg_win() > 0
+    assert an.avg_loss() < 0, "avg_loss must be a NEGATIVE number, not abs()"
+    print(f"  profit_factor={pf:.2f}, win_rate={an.win_rate():.2f}, avg_loss={an.avg_loss():.2f}  [PASS]")
+
+
+def test_analytics_risk_metrics_offline():
+    print("\n--- M5.1 Analytics: Sortino, Calmar, exposure_time ---")
+    dates = pd.bdate_range("2023-01-03", periods=60)
+    # Mostly-up series with one drawdown stretch so MDD < 0 and Sortino is finite.
+    values = [100_000.0]
+    for i in range(1, 60):
+        if 20 <= i < 30:
+            values.append(values[-1] * 0.99)  # drawdown phase
+        else:
+            values.append(values[-1] * 1.005)  # uptrend phase
+    holdings_values = [v - 1_000.0 for v in values]
+    history = _build_history(dates, values, holdings_values)
+    an = Analytics(history, trades=[], config=_Config())
+
+    sortino = an.sortino_ratio()
+    calmar = an.calmar_ratio()
+    exp = an.exposure_time()
+    assert sortino == sortino, "sortino should be finite"
+    assert calmar == calmar, "calmar should be finite"
+    assert abs(exp - 1.0) < 1e-9, f"exposure should be 1.0, got {exp}"
+    print(f"  sortino={sortino:.2f}, calmar={calmar:.2f}, exposure={exp:.3f}  [PASS]")
+
+
+def test_analytics_generate_report_offline():
+    print("\n--- M5.1 Analytics: generate_report writes HTML ---")
+    dates = pd.bdate_range("2023-01-03", periods=60)
+    values = [100_000.0 * (1 + 0.001 * i) for i in range(60)]
+    holdings_values = [v - 1_000.0 for v in values]
+    history = _build_history(dates, values, holdings_values)
+    trades = [
+        {"date": dates[0].date(), "ticker": "AAPL", "shares": 100, "fill_price": 150.0, "commission": 1.0, "side": "buy"},
+        {"date": dates[20].date(), "ticker": "AAPL", "shares": -100, "fill_price": 160.0, "commission": 1.0, "side": "sell"},
+    ]
+    an = Analytics(history, trades=trades, config=_Config())
+    out = Path("test_report_offline.html")
+    try:
+        an.generate_report(str(out))
+        size = out.stat().st_size
+        assert size > 10_000, f"report size {size} bytes is suspiciously small"
+        # Sanity: the HTML must contain the table title and a plotly div.
+        text = out.read_text(encoding="utf-8")
+        assert "Backtest report" in text
+        assert "plotly" in text.lower()
+        print(f"  wrote {out} ({size:,} bytes)  [PASS]")
+    finally:
+        if out.exists():
+            out.unlink()
+
+
 def main() -> None:
     test_no_lookahead()
     test_no_lookahead_fundamentals()
@@ -202,6 +378,12 @@ def main() -> None:
     test_valuescreen_basic()
     test_valuescreen_skips_negative_eps()
     test_valuescreen_no_filing_yet()
+    test_analytics_allcash_offline()
+    test_analytics_buyandhold_open_position_offline()
+    test_analytics_fifo_matching_offline()
+    test_analytics_profit_factor_with_losses()
+    test_analytics_risk_metrics_offline()
+    test_analytics_generate_report_offline()
     print("\n" + "=" * 60)
     print("ALL OFFLINE TESTS PASS")
     print("=" * 60)

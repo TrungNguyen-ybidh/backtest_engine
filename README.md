@@ -236,8 +236,19 @@ Backtest Summary  2023-01-03 -> 2023-12-29  (250 trading days)
   Annualized vol               19.94%
   Sharpe (RFR=0)                 2.32
   Max drawdown                -14.92%
+  Sortino (RFR=0)                3.10
+  Calmar                         3.72
+  Exposure time               100.00%
   Trades                            2
   Total commission    $          4.05
+
+  TRADES (closed round-trips, FIFO-matched)
+    Closed round-trips              0
+    Win rate                      n/a
+    Avg win                       n/a
+    Avg loss                      n/a
+    Profit factor                 n/a
+    Avg duration (days)           n/a
 
 Caveats (per output-limitations.md):
   ...
@@ -251,10 +262,40 @@ Field by field:
 - **Annualized vol** — `std(daily_returns) * sqrt(252)`. Sample std (ddof=1).
 - **Sharpe (RFR=0)** — `mean(daily_returns) / std(daily_returns) * sqrt(252)`. Risk-free rate is 0 for v1 — a real RFR via `get_factors` lands in v1.x. `NaN` when std is 0 (e.g., AllCash).
 - **Max drawdown** — most negative point on `value / cummax(value) - 1`. Always ≤ 0.
+- **Sortino (RFR=0)** — Sharpe-style ratio with downside-only deviation as denominator: `mean(daily_returns) / std(daily_returns_where_<0) * sqrt(252)`. NaN when there are fewer than 2 negative-return days.
+- **Calmar** — `annualized_return / abs(max_drawdown)`. NaN if max drawdown is 0.
+- **Exposure time** — fraction of history rows with `holdings_value > 0`. AllCash → 0, BuyAndHold → ≈ 1.
 - **Trades** — `len(broker.trades)`. Each fill (one ticker, one side) counts as one.
 - **Total commission** — sum of `commission` across all trades.
 
+The trailing **TRADES** block reports only **closed round-trips** matched via FIFO (see [Trade-level analytics](#trade-level-analytics-fifo-round-trips) below). Open lots are excluded from these stats and surfaced separately on `Analytics.open_positions`.
+
 If `config.benchmark` is set, a second block reports the same metrics for the benchmark (rescaled to start at `initial_capital`) plus an **Active return** line = `strategy_total_return - benchmark_total_return`.
+
+### Trade-level analytics (FIFO round-trips)
+
+`Analytics` builds a closed-round-trip DataFrame at construction time via FIFO matching. Buy lots are pushed onto a per-ticker FIFO queue; sells consume them front-first. Commission is allocated per share on both entry and exit, so reported `pnl` is net of frictions (slippage is already baked into `fill_price` by the Broker).
+
+Two attributes:
+
+- `analytics.trade_pnl` — `DataFrame[ticker, entry_date, exit_date, shares, entry_price, exit_price, pnl, pct_return, duration_days]`. `pct_return` is anchored to entry notional, not portfolio value.
+- `analytics.open_positions` — `DataFrame[ticker, entry_date, shares_remaining, entry_price]`. The FIFO leftover at the end of the trade stream.
+
+Helper methods (all empty-safe — return `nan` / `0` rather than raise):
+
+| Method | Returns |
+|---|---|
+| `total_trades()` | count of closed round-trips |
+| `win_rate()` | fraction of rows with `pnl > 0` |
+| `avg_win()` | mean of positive `pnl` |
+| `avg_loss()` | mean of negative `pnl` (returned as a negative number, **not** `abs`) |
+| `profit_factor()` | `sum(wins) / abs(sum(losses))`; `inf` if no losses + ≥1 win; `nan` if both empty |
+| `avg_trade_duration()` | mean of `duration_days` |
+| `sortino_ratio()` | downside-std variant of Sharpe |
+| `calmar_ratio()` | `annual_return / abs(max_drawdown)` |
+| `exposure_time()` | fraction of rows holding any position |
+
+FIFO is chosen over LIFO/avg-cost: it matches the typical brokerage tax-lot default and gives deterministic, intuitive entry→exit pairs for trade review. If a tax-aware or wash-sale variant is ever needed, `_compute_trade_pnl` is the single chokepoint to swap.
 
 ### `Analytics.plot_equity_curve()`
 
@@ -263,6 +304,22 @@ Returns a plotly `go.Figure` with the strategy's `total_value` as a solid line; 
 ### `Analytics.plot_trades(ticker)`
 
 Returns a plotly `go.Figure` with green triangle-up markers at buy fills and red triangle-down markers at sell fills for the given ticker. No candlestick overlay — `close` is split- and dividend-adjusted, which would make candles misleading. Raises `ValueError` if no trades exist for the ticker.
+
+### `Analytics.plot_drawdown()`
+
+Returns a plotly `go.Figure` with the underwater drawdown series (`value / cummax(value) - 1`) rendered as a red filled area, y-axis formatted as percent.
+
+### `Analytics.plot_monthly_returns()`
+
+Heatmap of monthly compounded returns. Years on the y-axis (top → bottom = oldest → newest), months on the x-axis, percent values shown inline, RdYlGn colorscale centered at zero.
+
+### `Analytics.generate_report(output_path)`
+
+Writes a self-contained HTML report to `output_path` containing: a metrics summary table (Sharpe, Sortino, Calmar, exposure, win rate, profit factor, …), the equity curve, the drawdown chart, the monthly-returns heatmap, and the standard caveats block. The first plot bundles plotly.js from the CDN; subsequent plots reuse it, so the file stays compact (≈ 30 KB for a one-year run).
+
+```python
+analytics.generate_report("backtest_report.html")
+```
 
 ## Cost model
 
