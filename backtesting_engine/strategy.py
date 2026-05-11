@@ -17,6 +17,8 @@ from typing import Optional
 
 import pandas as pd
 
+from .models import LimitOrder
+
 
 # Tolerance for floating-point sum check (e.g., 1/3 * 3 = 0.9999...).
 _WEIGHT_SUM_EPS = 1e-9
@@ -27,6 +29,18 @@ class Strategy(ABC):
     # Empty tuple = price-only strategy. Engine does NOT pass `fundamentals`
     # to `_compute` when this is empty — the kwarg is None.
     requires_fundamentals: tuple[str, ...] = ()
+
+    # M9: when True, the engine does NOT auto-exit holdings missing from the
+    # returned weight dict. The strategy is asserting "I handle entries and
+    # exits myself" — typically via limit orders. Default False preserves v1
+    # semantics where {ticker: weight} is the FULL target portfolio.
+    manages_positions: bool = False
+
+    # M10: when True, _validate_weights accepts negative weights in [-1, 1]
+    # with sum(|w|) <= 1.0. Engine writes this from config.allow_short at the
+    # start of run() so the strategy and broker stay in sync. Default False
+    # preserves the v1 long-only contract exactly.
+    allow_short: bool = False
 
     def generate_signals(
         self,
@@ -74,11 +88,47 @@ class Strategy(ABC):
     ) -> dict[str, float]:
         ...
 
-    @staticmethod
-    def _validate_weights(weights: dict[str, float]) -> None:
+    def generate_orders(
+        self,
+        current_date: date,
+        price_data: pd.DataFrame,
+        fundamentals: Optional[dict[str, pd.DataFrame]] = None,
+        holdings: Optional[dict[str, int]] = None,
+    ) -> list[LimitOrder]:
+        """v1.1 (M9): emit new limit orders for the broker's open book.
+
+        Default implementation returns []. Subclasses override to use limits.
+        Coexists with `generate_signals` — engine routes weights to market
+        orders (only on rebalance days) and limit orders to the limit book
+        (every day, regardless of rebalance frequency).
+
+        `holdings` is a read-only snapshot of `{ticker: shares}` passed by the
+        engine. Strategy can use it to make share-count decisions (e.g., skip
+        emitting a buy limit when already in the position). The strategy still
+        never touches Broker directly — this is the same hand-in-data pattern
+        as `price_data`.
+        """
+        return []
+
+    def _validate_weights(self, weights: dict[str, float]) -> None:
+        """Validate the weight dict returned by `_compute`.
+
+        Long-only contract (allow_short=False, v1 default):
+          - Each weight in [0, 1].
+          - sum(weights) <= 1.0 (leftover sits in cash).
+
+        Long/short contract (allow_short=True, v1.1 M10):
+          - Each weight in [-1, 1]. Negative = short position.
+          - sum(|weights|) <= 1.0 (gross exposure cap).
+
+        This is the single chokepoint for rule #4 in critical-rules.md. Any
+        change here must update that file in lockstep.
+        """
         if not isinstance(weights, dict):
             raise TypeError(f"weights must be dict, got {type(weights).__name__}")
-        total = 0.0
+
+        lower, upper = (-1.0, 1.0) if self.allow_short else (0.0, 1.0)
+        gross = 0.0
         for ticker, w in weights.items():
             if not isinstance(ticker, str) or not ticker:
                 raise ValueError(f"ticker keys must be non-empty strings, got {ticker!r}")
@@ -86,11 +136,14 @@ class Strategy(ABC):
                 raise TypeError(f"weight for {ticker!r} must be numeric, got {type(w).__name__}")
             if math.isnan(w) or math.isinf(w):
                 raise ValueError(f"weight for {ticker!r} is not finite: {w}")
-            if w < 0.0 or w > 1.0:
-                raise ValueError(f"weight for {ticker!r} must be in [0, 1], got {w}")
-            total += w
-        if total > 1.0 + _WEIGHT_SUM_EPS:
-            raise ValueError(f"weights sum to {total}, must be <= 1.0")
+            if w < lower or w > upper:
+                raise ValueError(
+                    f"weight for {ticker!r} must be in [{lower}, {upper}], got {w}"
+                )
+            gross += abs(w) if self.allow_short else w
+        if gross > 1.0 + _WEIGHT_SUM_EPS:
+            cap_name = "sum(|weights|)" if self.allow_short else "sum(weights)"
+            raise ValueError(f"{cap_name} = {gross}, must be <= 1.0")
 
 
 class AllCash(Strategy):
@@ -245,3 +298,105 @@ class ValueScreen(Strategy):
         top = sorted(yields, key=yields.get, reverse=True)[: self.top_n]
         w = 1.0 / self.top_n
         return {t: w for t in top}
+
+
+class LimitBuyTheDip(Strategy):
+    """Reference M9 strategy. Equal-weight buy-and-hold, but entries happen
+    via day-only buy limit orders placed `drop_pct` below the previous close.
+
+    Once a ticker has any position (the limit filled at least once), no more
+    limits are emitted for it — the strategy just rides. `generate_signals`
+    returns an empty weight dict so the engine performs no market trades.
+
+    Requires `manages_positions=True` so the engine does NOT auto-exit the
+    limit-acquired holdings on rebalance days (the default rule would treat
+    an empty weight dict as "100% cash" and unwind everything).
+    """
+
+    manages_positions = True
+
+    def __init__(
+        self,
+        tickers: list[str],
+        drop_pct: float = 0.02,
+        shares_per_order: int = 100,
+    ):
+        if not isinstance(tickers, list) or not tickers:
+            raise ValueError("tickers must be a non-empty list")
+        if any(not isinstance(t, str) or not t for t in tickers):
+            raise ValueError("every ticker must be a non-empty string")
+        if not isinstance(drop_pct, (int, float)) or drop_pct <= 0 or drop_pct >= 1:
+            raise ValueError("drop_pct must be in (0, 1)")
+        if not isinstance(shares_per_order, int) or shares_per_order <= 0:
+            raise ValueError("shares_per_order must be a positive int")
+
+        self.tickers = [t.upper() for t in tickers]
+        self.drop_pct = float(drop_pct)
+        self.shares_per_order = shares_per_order
+
+    def _compute(self, current_date, price_data, fundamentals):
+        # No market-order rebalancing; entries come purely from limits.
+        return {}
+
+    def generate_orders(self, current_date, price_data, fundamentals=None, holdings=None):
+        if price_data.empty:
+            return []
+        held = holdings or {}
+        orders: list[LimitOrder] = []
+        # Use the most recent close per ticker through current_date as the anchor.
+        latest_close = (
+            price_data.sort_values(["ticker", "date"])
+            .groupby("ticker")["close"]
+            .last()
+        )
+        for ticker in self.tickers:
+            if held.get(ticker, 0) > 0:
+                continue  # already entered — ride
+            if ticker not in latest_close.index:
+                continue
+            anchor = float(latest_close.loc[ticker])
+            if anchor <= 0:
+                continue
+            limit_price = round(anchor * (1.0 - self.drop_pct), 4)
+            orders.append(LimitOrder(
+                ticker=ticker,
+                side="buy",
+                shares=self.shares_per_order,
+                limit_price=limit_price,
+                lifetime="day",
+            ))
+        return orders
+
+
+class LongShortBarbell(Strategy):
+    """M10 reference strategy. Equal-weight `longs` at +1/N and `shorts` at -1/N.
+
+    N = len(longs) + len(shorts). sum(|w|) = 1.0 exactly — sits at the gross
+    exposure cap. Requires `BacktestConfig(allow_short=True)`; the engine
+    writes the flag onto the strategy at run() start.
+    """
+
+    def __init__(self, longs: list[str], shorts: list[str]):
+        if not isinstance(longs, list) or not isinstance(shorts, list):
+            raise TypeError("longs and shorts must be lists")
+        if any(not isinstance(t, str) or not t for t in (*longs, *shorts)):
+            raise ValueError("every ticker must be a non-empty string")
+        if not longs and not shorts:
+            raise ValueError("at least one of longs / shorts must be non-empty")
+
+        upper_longs = [t.upper() for t in longs]
+        upper_shorts = [t.upper() for t in shorts]
+        overlap = set(upper_longs) & set(upper_shorts)
+        if overlap:
+            raise ValueError(f"ticker cannot be both long and short: {sorted(overlap)}")
+
+        self.longs = upper_longs
+        self.shorts = upper_shorts
+
+    def _compute(self, current_date, price_data, fundamentals):
+        n = len(self.longs) + len(self.shorts)
+        w = 1.0 / n
+        weights = {t: w for t in self.longs}
+        for t in self.shorts:
+            weights[t] = -w
+        return weights

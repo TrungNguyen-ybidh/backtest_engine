@@ -18,6 +18,17 @@ class BacktestConfig:
     commission_min: float = 1.0
     slippage_bps: float = 5.0
 
+    # v1.1 (M8): how often the engine calls the strategy and trades.
+    # Default 'daily' preserves v1 behavior exactly. Mark-to-market still
+    # happens every trading day regardless — only the rebalance trades skip.
+    rebalance_frequency: str = "daily"
+
+    # v1.1 (M10): enable short selling. When True, strategies may emit negative
+    # weights and the broker tracks long_holdings + short_holdings books with
+    # Reg T margin enforcement (initial 50%, maintenance 25%). Default False
+    # preserves v1 long-only behavior exactly.
+    allow_short: bool = False
+
     db_url: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -39,6 +50,14 @@ class BacktestConfig:
             raise ValueError("commission_min must be >= 0")
         if self.slippage_bps < 0:
             raise ValueError("slippage_bps must be >= 0")
+
+        # Daily bars only — sub-daily frequencies are out of v1.1 scope.
+        allowed_freq = {"daily", "weekly", "monthly", "quarterly", "yearly"}
+        if self.rebalance_frequency not in allowed_freq:
+            raise ValueError(
+                f"rebalance_frequency must be one of {sorted(allowed_freq)}, "
+                f"got {self.rebalance_frequency!r}"
+            )
 
         self.tickers = [t.upper() for t in self.tickers]
         if self.benchmark is not None:

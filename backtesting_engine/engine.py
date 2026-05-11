@@ -9,9 +9,13 @@ Daily loop contract:
   floor-rounded to whole shares (v1 has no fractionals).
 - Sells execute before buys so freed cash funds buys.
 - Trades are date-tagged on broker.trades[-1] post-execution (broker is date-agnostic).
+- Mark-to-market runs every trading day. Rebalance trades only on days where
+  `_is_rebalance_day()` is True (M8). Default frequency 'daily' = trade every day,
+  matching v1 behavior exactly.
 """
 
 import math
+from datetime import date
 
 import pandas as pd
 
@@ -34,8 +38,16 @@ class Engine:
         self.strategy = strategy
         self.broker = broker
         self.history: list[dict] = []
+        # Last date on which we ran the strategy and traded. None until the
+        # first rebalance fires — the very first trading day always rebalances.
+        self._last_rebalance_date: date | None = None
 
     def run(self) -> None:
+        # M10: propagate allow_short to broker + strategy so all three agree on
+        # the same contract. Single source of truth = config.
+        self.broker.allow_short = self.config.allow_short
+        self.strategy.allow_short = self.config.allow_short
+
         # One-shot fetch: all prices for the whole window, sliced per-day in memory.
         universe = list(self.config.tickers)
         if self.config.benchmark and self.config.benchmark not in universe:
@@ -89,12 +101,54 @@ class Engine:
             current_prices: dict[str, float] = dict(
                 zip(today_rows["ticker"], today_rows["close"])
             )
+            # OHLC dict for limit-order fill checks. open/high/low come straight
+            # from DataInterface and are split/dividend-adjusted alongside close.
+            today_ohlc: dict[str, dict] = {
+                row.ticker: {
+                    "open": row.open, "high": row.high,
+                    "low": row.low, "close": row.close,
+                }
+                for row in today_rows.itertuples(index=False)
+            }
 
+            # M9: process pending limit orders first. Fills modify cash/holdings
+            # BEFORE the MTM step so pv reflects the post-fill state used by
+            # rebalance sizing. Date-tag any new trades the broker just produced.
+            n_trades_before = len(self.broker.trades)
+            self.broker.process_open_orders(current_date, today_ohlc)
+            for tr in self.broker.trades[n_trades_before:]:
+                tr["date"] = current_date
+
+            # Mark-to-market every trading day, regardless of rebalance frequency.
+            # broker.total_value walks both long and short books and raises
+            # KeyError if any held ticker is missing — we pass current_prices
+            # entirely; unused entries are harmless.
+            try:
+                pv = self.broker.total_value(current_prices)
+            except KeyError as e:
+                # Still expire stale orders so they don't accumulate during gaps.
+                self.broker.expire_orders(current_date)
+                self._record_day(current_date, current_prices, note=f"missing_price:{e}")
+                continue
+
+            # M10: Reg T maintenance margin check on the post-MTM state. If
+            # equity / total exposure < 25%, liquidate ALL shorts at today's
+            # close (broker forces the cover even if cash goes negative — the
+            # account is being unwound). Re-MTM after liquidation.
+            if (
+                self.config.allow_short
+                and self.broker.short_holdings
+                and not self.broker.maintenance_margin_ok(current_prices)
+            ):
+                self.broker.liquidate_all_shorts(current_prices, current_date)
+                # Re-MTM with shorts gone (broker.total_value handles empty book).
+                pv = self.broker.total_value(current_prices)
+
+            # Build price/fundamentals slices for the strategy hooks.
             # History through today inclusive — Strategy sees today's close.
             price_hist = all_prices[all_prices["date_only"] <= current_date].drop(
                 columns=["date_only"]
             )
-
             # Slice fundamentals by filing_date <= current_date. Critical rule #2:
             # `filing_date` (when public) gates look-ahead, not period-end `date`.
             fundamentals_today: dict[str, pd.DataFrame] | None = None
@@ -107,51 +161,122 @@ class Engine:
                     mask = df["filing_date"].dt.date <= current_date
                     fundamentals_today[name] = df[mask]
 
-            weights = self.strategy.generate_signals(
-                current_date, price_hist, fundamentals=fundamentals_today
-            )
-
-            # Mark-to-market using today's close. If a held ticker has no price
-            # today (delisting/halt mid-window), skip rebalance and record the gap.
-            try:
-                pv = self.broker.total_value(
-                    {t: current_prices[t] for t in self.broker.holdings}
+            # Rebalance only on days where the configured frequency fires.
+            # The very first trading day always rebalances so the strategy
+            # gets a chance to enter its initial positions.
+            if self._is_rebalance_day(current_date):
+                weights = self.strategy.generate_signals(
+                    current_date, price_hist, fundamentals=fundamentals_today
                 )
-            except KeyError as e:
-                self._record_day(current_date, current_prices, note=f"missing_price:{e}")
-                continue
 
-            # Target shares per ticker. Tickers absent from current_prices today
-            # can't be traded — skip them rather than guess a price.
-            targets: dict[str, int] = {}
-            for ticker, weight in weights.items():
-                if ticker not in current_prices:
-                    continue
-                price = current_prices[ticker]
-                if price <= 0:
-                    continue
-                targets[ticker] = math.floor(weight * pv / price)
+                # Signed target shares per ticker. Negative = short target.
+                # Tickers absent from current_prices today can't be traded.
+                targets: dict[str, int] = {}
+                for ticker, weight in weights.items():
+                    if ticker not in current_prices:
+                        continue
+                    price = current_prices[ticker]
+                    if price <= 0:
+                        continue
+                    magnitude = math.floor(abs(weight) * pv / price)
+                    targets[ticker] = -magnitude if weight < 0 else magnitude
 
-            # Deltas across the union of (held, targeted). Untargeted holdings
-            # implicitly target 0 — fully exit positions the strategy dropped.
-            deltas: dict[str, int] = {}
-            for ticker in set(targets) | set(self.broker.holdings):
-                current_qty = self.broker.holdings.get(ticker, 0)
-                target_qty = targets.get(ticker, 0)
-                delta = target_qty - current_qty
-                if delta != 0:
-                    deltas[ticker] = delta
+                # Universe for delta computation. `manages_positions=True`
+                # tells the engine "don't touch holdings I didn't target".
+                manages = getattr(self.strategy, "manages_positions", False)
+                if manages:
+                    delta_universe: set[str] = set(targets)
+                else:
+                    delta_universe = (
+                        set(targets)
+                        | set(self.broker.long_holdings)
+                        | set(self.broker.short_holdings)
+                    )
 
-            # Sells first (frees cash), then buys.
-            sells = sorted((t, d) for t, d in deltas.items() if d < 0)
-            buys = sorted((t, d) for t, d in deltas.items() if d > 0)
+                # Route each ticker into atomic close/open actions. A flip
+                # (long→short or short→long) emits TWO actions in sequence.
+                closes: list[tuple[str, str, int]] = []  # (ticker, action, qty)
+                opens: list[tuple[str, str, int]] = []
+                for ticker in delta_universe:
+                    target_signed = targets.get(ticker, 0)
+                    for action, qty in self._route_actions(ticker, target_signed):
+                        if action in ("SELL", "COVER"):
+                            closes.append((ticker, action, qty))
+                        else:
+                            opens.append((ticker, action, qty))
 
-            for ticker, delta in sells:
-                self._execute_with_tag(ticker, delta, current_prices[ticker], current_date)
-            for ticker, delta in buys:
-                self._buy_with_retry(ticker, delta, current_prices[ticker], current_date)
+                # Closes/covers first (frees cash), then opens. Alphabetical
+                # within each bucket for determinism.
+                closes.sort()
+                opens.sort()
+                for ticker, action, qty in closes:
+                    price_now = current_prices[ticker]
+                    if action == "SELL":
+                        self._execute_with_tag(ticker, -qty, price_now, current_date)
+                    else:  # COVER
+                        self._cover_with_retry(ticker, qty, price_now, current_date)
+                for ticker, action, qty in opens:
+                    price_now = current_prices[ticker]
+                    if action == "BUY":
+                        self._buy_with_retry(ticker, qty, price_now, current_date)
+                    else:  # SHORT_OPEN
+                        self._short_open_with_retry(
+                            ticker, qty, price_now, current_prices, current_date
+                        )
+
+                self._last_rebalance_date = current_date
+
+            # M9: every day, let the strategy emit new limit orders. Coexists
+            # with rebalance — a strategy may use both channels. `holdings`
+            # snapshot is long-side only (limits are long-only in v1.1).
+            new_orders = self.strategy.generate_orders(
+                current_date,
+                price_hist,
+                fundamentals=fundamentals_today,
+                holdings=dict(self.broker.long_holdings),
+            )
+            for order in new_orders:
+                self.broker.place_limit_order(order, placed_on=current_date)
+
+            # End of day: expire orders past their lifetime.
+            self.broker.expire_orders(current_date)
 
             self._record_day(current_date, current_prices)
+
+    def _is_rebalance_day(self, current_date: date) -> bool:
+        """Return True if today is a rebalance day under the configured frequency.
+
+        First trading day always rebalances so the strategy can enter positions.
+        After that, the boundary rules are:
+          - daily      → every day
+          - weekly     → ISO (year, week) changed since last rebalance
+          - monthly    → (year, month) changed
+          - quarterly  → (year, quarter) changed (quarter = (month-1)//3)
+          - yearly     → year changed
+        Using "boundary changed" rather than "first calendar day of period"
+        is robust to holidays — e.g., Jan 1 closed → first trading day is Jan 2
+        and that's still treated as the new-year rebalance.
+        """
+        if self._last_rebalance_date is None:
+            return True
+
+        freq = self.config.rebalance_frequency
+        last = self._last_rebalance_date
+
+        if freq == "daily":
+            return True
+        if freq == "weekly":
+            return current_date.isocalendar()[:2] != last.isocalendar()[:2]
+        if freq == "monthly":
+            return (current_date.year, current_date.month) != (last.year, last.month)
+        if freq == "quarterly":
+            cur_q = (current_date.month - 1) // 3
+            last_q = (last.month - 1) // 3
+            return (current_date.year, cur_q) != (last.year, last_q)
+        if freq == "yearly":
+            return current_date.year != last.year
+        # Config validation should have rejected anything else; defensive raise.
+        raise ValueError(f"unknown rebalance_frequency: {freq!r}")
 
     def _execute_with_tag(
         self, ticker: str, shares: int, price: float, current_date
@@ -178,25 +303,118 @@ class Engine:
                 shares -= 1
         # shares == 0 → nothing to buy; silently skip.
 
+    def _cover_with_retry(
+        self, ticker: str, shares: int, price: float, current_date
+    ) -> None:
+        """Cover with shrink-and-retry on insufficient-cash rejection.
+
+        Mirrors `_buy_with_retry` — covers are cash-consuming like buys, so the
+        same edge case (floor-rounding tipping cost over cash) applies. Note
+        this is NOT the margin-call path; that goes through
+        `broker.liquidate_all_shorts` with `force=True`.
+        """
+        while shares > 0:
+            try:
+                self.broker.execute_short_cover(ticker, shares, price)
+                self.broker.trades[-1]["date"] = current_date
+                return
+            except ValueError:
+                shares -= 1
+
+    def _short_open_with_retry(
+        self,
+        ticker: str,
+        shares: int,
+        price: float,
+        current_prices: dict[str, float],
+        current_date,
+    ) -> None:
+        """Open a short with shrink-and-retry on initial-margin rejection.
+
+        If the prospective gross short exposure would tip past 50% of PV,
+        Broker raises ValueError. Shrinking shares by 1 and retrying yields
+        the largest short we can afford to open under the cap.
+        """
+        while shares > 0:
+            try:
+                self.broker.execute_short_open(ticker, shares, price, current_prices)
+                self.broker.trades[-1]["date"] = current_date
+                return
+            except ValueError:
+                shares -= 1
+
+    def _route_actions(
+        self, ticker: str, target_signed: int
+    ) -> list[tuple[str, int]]:
+        """Map (current book state + signed target) → list of atomic actions.
+
+        Action names: 'BUY' / 'SELL' (long book), 'SHORT_OPEN' / 'COVER' (short book).
+        A flip (long → short or short → long) emits two actions in order.
+        Quantities returned are always positive integers.
+
+        9 cases (3 current × 3 target):
+          - current_long  >0, target  >0: adjust long by delta sign
+          - current_long  >0, target  =0: SELL all
+          - current_long  >0, target  <0: SELL all + SHORT_OPEN |target|
+          - current_short >0, target  <0: adjust short by delta sign
+          - current_short >0, target  =0: COVER all
+          - current_short >0, target  >0: COVER all + BUY target
+          - flat,            target  >0: BUY
+          - flat,            target  <0: SHORT_OPEN
+          - flat,            target  =0: noop
+        """
+        current_long = self.broker.long_holdings.get(ticker, 0)
+        current_short = self.broker.short_holdings.get(ticker, 0)
+        actions: list[tuple[str, int]] = []
+
+        if current_long > 0:
+            if target_signed >= 0:
+                delta = target_signed - current_long
+                if delta > 0:
+                    actions.append(("BUY", delta))
+                elif delta < 0:
+                    actions.append(("SELL", -delta))
+            else:  # flip long → short
+                actions.append(("SELL", current_long))
+                actions.append(("SHORT_OPEN", -target_signed))
+        elif current_short > 0:
+            if target_signed <= 0:
+                new_short = -target_signed  # positive
+                delta = new_short - current_short
+                if delta > 0:
+                    actions.append(("SHORT_OPEN", delta))
+                elif delta < 0:
+                    actions.append(("COVER", -delta))
+            else:  # flip short → long
+                actions.append(("COVER", current_short))
+                actions.append(("BUY", target_signed))
+        else:  # flat
+            if target_signed > 0:
+                actions.append(("BUY", target_signed))
+            elif target_signed < 0:
+                actions.append(("SHORT_OPEN", -target_signed))
+
+        return actions
+
     def _record_day(
         self,
         current_date,
         current_prices: dict[str, float],
         note: str | None = None,
     ) -> None:
-        """Append one history row. Tolerates missing prices for held tickers."""
+        """Append one history row. Tolerates missing prices for held tickers.
+
+        `holdings_value` is NET = long MTM − short MTM. For pure-long runs
+        (no shorts ever opened) this equals the v1 behavior exactly.
+        """
         try:
-            total_value = self.broker.total_value(
-                {t: current_prices[t] for t in self.broker.holdings}
-            )
+            total_value = self.broker.total_value(current_prices)
         except KeyError:
-            # Reuse previous total_value if we can; otherwise just record cash.
             total_value = float("nan")
 
         bench = self.config.benchmark
         benchmark_price = current_prices.get(bench) if bench else None
 
-        # Count today's trades by scanning the tail of broker.trades.
         n_trades_today = sum(
             1 for tr in reversed(self.broker.trades)
             if tr.get("date") == current_date
@@ -210,7 +428,8 @@ class Engine:
                 total_value - self.broker.cash
                 if not pd.isna(total_value) else float("nan")
             ),
-            "holdings": dict(self.broker.holdings),
+            "holdings": dict(self.broker.long_holdings),
+            "short_holdings": dict(self.broker.short_holdings),
             "benchmark_price": benchmark_price,
             "n_trades": n_trades_today,
         }

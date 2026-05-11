@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backtesting_engine"
+version = "1.1.0"
+description = "Modular Python backtesting engine for systematic trading strategies"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Trung Nguyen" }]
+license = { text = "Proprietary" }
+keywords = ["backtesting", "quantitative-finance", "trading", "strategy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "plotly>=5.0",
+    "SQLAlchemy>=2.0",
+    "PyMySQL>=1.0",
+    "cryptography>=40",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipykernel",
+    "ipywidgets",
+]
+
+[tool.setuptools.packages.find]
+include = ["backtesting_engine*"]
+exclude = ["__pycache__*"]
